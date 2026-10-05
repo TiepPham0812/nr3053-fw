@@ -1,93 +1,205 @@
-#!/bin/bash
-# Tao file FIT chay thu trong RAM: kernel + DTB + rootfs (cpio, khong nen).
-# Kernel OpenWrt bat BLK_DEV_INITRD nhung tat moi kieu giai nen ramdisk,
-# nen ramdisk phai la cpio KHONG NEN.
-# Dung: mk-initramfs.sh <root.squashfs> <kernel.lzma> <board.dtb> <output.itb>
-set -euo pipefail
-SQ=$(readlink -f "$1"); KL=$(readlink -f "$2"); DTB=$(readlink -f "$3"); OUT=$(readlink -f -m "$4")
-SUDO=""; [ "$(id -u)" = 0 ] || SUDO=sudo
+name: Build NR3053 - ImmortalWrt chinh hang + USB
 
-W=$(mktemp -d)
-trap '$SUDO rm -rf "$W"' EXIT
-cd "$W"
+# Dong firmware cho SDMC NR3053 bang ImageBuilder CHINH HANG cua ImmortalWrt.
+# Kernel la kernel chinh hang -> moi goi kmod trong kho ImmortalWrt deu cai duoc.
+# Chi thay 1 thu: cay thiet bi (DTB) cua NR3053 da bat USB, nam trong thu muc dtb/.
 
-$SUDO unsquashfs -q -d root "$SQ" >/dev/null
+on:
+  workflow_dispatch:
+    inputs:
+      ib_version:
+        description: "Phien ban ImmortalWrt (vd 25.12.1)"
+        default: "25.12.1"
+        required: true
+      extra_packages:
+        description: "Goi cai them, cach nhau dau cach (de trong neu khong can)"
+        default: ""
+        required: false
 
-# /init giong het target/linux/generic/other-files/init cua OpenWrt:
-# INITRAMFS=1 de preinit KHONG mount phan vung NAND.
-$SUDO tee root/init >/dev/null <<'EOF'
-#!/bin/sh
-# Copyright (C) 2006 OpenWrt.org
-export INITRAMFS=1
+permissions:
+  contents: write
 
-# switch to tmpfs to allow run daemons in jail on initramfs boot
-DIRS=$(echo *)
-NEW_ROOT=/new_root
+env:
+  HOST_PROFILE: jcg_q30-pro   # profile muon tam de qua buoc kiem tra cua ImageBuilder
+  BASE_PACKAGES: >-
+    luci
+    kmod-usb3 kmod-usb-xhci-mtk kmod-usb-storage kmod-usb-storage-uas usbutils
+    kmod-usb-net-rndis kmod-usb-net-cdc-ether kmod-usb-net-cdc-ncm
+    kmod-usb-net-ipheth usbmuxd libimobiledevice
 
-mkdir -p $NEW_ROOT
-mount -t tmpfs tmpfs $NEW_ROOT
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 1. Lay ma nguon repo
+        uses: actions/checkout@v4
 
-cp -pr $DIRS $NEW_ROOT
+      - name: 2. Cai cong cu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses-dev zlib1g-dev gawk gettext \
+            libssl-dev xsltproc rsync wget unzip python3 python3-setuptools zstd xz-utils \
+            u-boot-tools device-tree-compiler squashfs-tools cpio file
 
-exec switch_root $NEW_ROOT /sbin/init
-EOF
-$SUDO chmod 755 root/init
-$SUDO mkdir -p root/dev
-[ -e root/dev/console ] || $SUDO mknod -m 600 root/dev/console c 5 1
+      - name: 3. Tai ImageBuilder chinh hang
+        run: |
+          V="${{ inputs.ib_version }}"
+          BASE="https://downloads.immortalwrt.org/releases/$V/targets/mediatek/filogic"
+          NAME=$(wget -qO- "$BASE/" | grep -oE "immortalwrt-imagebuilder-[^\"<>]+\.tar\.(zst|xz)" | head -1)
+          [ -n "$NAME" ] || NAME="immortalwrt-imagebuilder-$V-mediatek-filogic.Linux-x86_64.tar.zst"
+          echo "ImageBuilder: $NAME"
+          wget --tries=3 --timeout=60 -q "$BASE/$NAME" -O "$NAME"
+          mkdir ib && tar -xf "$NAME" -C ib --strip-components=1
+          rm -f "$NAME"
+          KDIR=$(ls -d "$PWD"/ib/build_dir/target-*/linux-mediatek_filogic)
+          echo "KDIR=$KDIR" >> "$GITHUB_ENV"
+          test -f "$KDIR/Image" || { echo "LOI: khong thay kernel Image trong ImageBuilder"; exit 1; }
+          test -f "$KDIR/${HOST_PROFILE}-kernel.bin" || { echo "LOI: khong thay ${HOST_PROFILE}-kernel.bin"; exit 1; }
+          echo "Vermagic kernel chinh hang:"; grep -h "LINUX_VERMAGIC:=" ib/include/kernel.mk || true
 
-(cd root && $SUDO find . -mindepth 1 | LC_ALL=C sort | $SUDO cpio -o -H newc -R 0:0 --quiet) > initrd.cpio
+      - name: 4. Dong kernel FIT cho NR3053 (kernel chinh hang + DTB bat USB)
+        run: |
+          mkdir fit && cd fit
+          # Nen kernel giong het cach OpenWrt lam (lc1 lp2 pb2, ghi kich thuoc that vao header)
+          LZ="$GITHUB_WORKSPACE/ib/staging_dir/host/bin/lzma"
+          if [ -x "$LZ" ]; then
+            "$LZ" e -lc1 -lp2 -pb2 "$KDIR/Image" kernel.lzma
+          else
+            python3 "$GITHUB_WORKSPACE/scripts/mklzma.py" "$KDIR/Image" kernel.lzma
+          fi
+          python3 -c "import lzma;assert lzma.decompress(open('kernel.lzma','rb').read(),format=lzma.FORMAT_ALONE)==open('$KDIR/Image','rb').read();print('LZMA OK')"
+          od -A d -t x1 -N 13 kernel.lzma
+          cp ../dtb/nr3053-usb.dtb board.dtb
+          echo "PHY USB: $(fdtget board.dtb /soc/usb-phy@11e10000 status)"
+          echo "Board  : $(fdtget board.dtb / compatible)"
+          cat > nr3053.its <<'EOF'
+          /dts-v1/;
+          / {
+          	description = "ARM64 ImmortalWrt FIT - SDMC NR3053 USB";
+          	#address-cells = <1>;
+          	images {
+          		kernel-1 {
+          			description = "ARM64 ImmortalWrt Linux (chinh hang)";
+          			data = /incbin/("kernel.lzma");
+          			type = "kernel";
+          			arch = "arm64";
+          			os = "linux";
+          			compression = "lzma";
+          			load = <0x48000000>;
+          			entry = <0x48000000>;
+          			hash-1 { algo = "crc32"; };
+          			hash-2 { algo = "sha1"; };
+          		};
+          		fdt-1 {
+          			description = "SDMC NR3053 device tree (USB enabled)";
+          			data = /incbin/("board.dtb");
+          			type = "flat_dt";
+          			arch = "arm64";
+          			compression = "none";
+          			hash-1 { algo = "crc32"; };
+          			hash-2 { algo = "sha1"; };
+          		};
+          	};
+          	configurations {
+          		default = "config-1";
+          		config-1 {
+          			description = "SDMC NR3053";
+          			kernel = "kernel-1";
+          			fdt = "fdt-1";
+          		};
+          	};
+          };
+          EOF
+          mkimage -f nr3053.its nr3053-kernel.itb
+          dumpimage -l nr3053-kernel.itb
+          cp nr3053-kernel.itb "$KDIR/${HOST_PROFILE}-kernel.bin"
 
-cp "$KL" kernel.lzma
-cp "$DTB" board.dtb
-cat > rd.its <<'EOF'
-/dts-v1/;
-/ {
-	description = "ARM64 ImmortalWrt FIT - SDMC NR3053 USB (RAM test)";
-	#address-cells = <1>;
-	images {
-		kernel-1 {
-			description = "ARM64 ImmortalWrt Linux (chinh hang)";
-			data = /incbin/("kernel.lzma");
-			type = "kernel";
-			arch = "arm64";
-			os = "linux";
-			compression = "lzma";
-			load = <0x48000000>;
-			entry = <0x48000000>;
-			hash-1 { algo = "crc32"; };
-			hash-2 { algo = "sha1"; };
-		};
-		fdt-1 {
-			description = "SDMC NR3053 device tree (USB enabled)";
-			data = /incbin/("board.dtb");
-			type = "flat_dt";
-			arch = "arm64";
-			compression = "none";
-			hash-1 { algo = "crc32"; };
-			hash-2 { algo = "sha1"; };
-		};
-		initrd-1 {
-			description = "SDMC NR3053 rootfs (RAM)";
-			data = /incbin/("initrd.cpio");
-			type = "ramdisk";
-			arch = "arm64";
-			os = "linux";
-			compression = "none";
-			hash-1 { algo = "crc32"; };
-			hash-2 { algo = "sha1"; };
-		};
-	};
-	configurations {
-		default = "config-1";
-		config-1 {
-			description = "SDMC NR3053 RAM test";
-			kernel = "kernel-1";
-			fdt = "fdt-1";
-			ramdisk = "initrd-1";
-		};
-	};
-};
-EOF
-mkimage -f rd.its "$OUT" >/dev/null
-dumpimage -l "$OUT" | grep -E "Image|Type|Data Size|Default|Ramdisk"
-echo "Kich thuoc: $(stat -c %s "$OUT") byte"
+      - name: 5. Doi profile thanh NR3053 (layout UBI kernel + rootfs, file .bin)
+        run: |
+          python3 - <<'EOF'
+          import re
+          p = 'ib/target/linux/mediatek/image/filogic.mk'
+          t = open(p).read()
+          new = """define Device/jcg_q30-pro
+            DEVICE_VENDOR := SDMC
+            DEVICE_MODEL := NR3053 USB
+            DEVICE_DTS := mt7981b-jcg-q30-pro
+            DEVICE_DTS_DIR := ../dts
+            SUPPORTED_DEVICES := sdmc,nr3053
+            BOARD_NAME := sdmc_nr3053
+            UBINIZE_OPTS := -E 5
+            BLOCKSIZE := 128k
+            PAGESIZE := 2048
+            KERNEL_IN_UBI := 1
+            IMAGES := sysupgrade.bin
+            IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+            DEVICE_PACKAGES := kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware
+          endef"""
+          t2, n = re.subn(r'define Device/jcg_q30-pro\n.*?\nendef', new, t, count=1, flags=re.S)
+          if n != 1:
+              raise SystemExit("LOI: khong tim thay Device/jcg_q30-pro")
+          open(p, 'w').write(t2)
+          EOF
+          grep -n -A14 "define Device/jcg_q30-pro" ib/target/linux/mediatek/image/filogic.mk
+
+      - name: 6. Dong firmware
+        run: |
+          cd ib
+          make image PROFILE="$HOST_PROFILE" \
+            PACKAGES="$BASE_PACKAGES ${{ inputs.extra_packages }}" \
+            FILES="$GITHUB_WORKSPACE/files"
+          ls -l bin/targets/mediatek/filogic/
+
+      - name: 7. Kiem tra firmware
+        run: |
+          OUT=ib/bin/targets/mediatek/filogic
+          SRC=$(ls $OUT/*-${HOST_PROFILE}-squashfs-sysupgrade.bin | head -1)
+          V="${{ inputs.ib_version }}"
+          DST="$PWD/immortalwrt-$V-sdmc_nr3053-usb-squashfs-sysupgrade.bin"
+          cp "$SRC" "$DST"
+          mkdir chk && cd chk && tar -xf "$DST"
+          ls -l sysupgrade-*/
+          cat sysupgrade-*/CONTROL
+          grep -q "BOARD=sdmc_nr3053" sysupgrade-*/CONTROL || { echo "LOI: sai BOARD"; exit 1; }
+          dumpimage -l sysupgrade-*/kernel | grep -q "NR3053" || { echo "LOI: kernel khong phai FIT NR3053"; exit 1; }
+          tail -c 2000 "$DST" | strings | grep -q '"sdmc,nr3053"' || { echo "LOI: thieu metadata sdmc,nr3053"; exit 1; }
+          unsquashfs -q -d r sysupgrade-*/root lib/apk/db/installed >/dev/null 2>&1 || true
+          echo "Kernel trong rootfs:"; grep -A1 "^P:kernel$" r/lib/apk/db/installed || true
+          for k in kmod-usb-xhci-mtk kmod-usb-net-rndis kmod-usb-net-ipheth kmod-usb-net-cdc-ncm; do
+            grep -q "^P:$k$" r/lib/apk/db/installed && echo "OK  $k" || { echo "THIEU $k"; exit 1; }
+          done
+          cd .. && sha256sum "$DST" | tee "$DST.sha256"
+          echo "FW=$DST" >> "$GITHUB_ENV"
+
+      - name: 8. Tao ban chay thu trong RAM (initramfs, khong ghi NAND)
+        run: |
+          V="${{ inputs.ib_version }}"
+          RD="$PWD/immortalwrt-$V-sdmc_nr3053-usb-initramfs-test.itb"
+          bash scripts/mk-initramfs.sh chk/sysupgrade-*/root fit/kernel.lzma fit/board.dtb "$RD"
+          sha256sum "$RD" | tee "$RD.sha256"
+          echo "RD=$RD" >> "$GITHUB_ENV"
+
+      - name: 9. Luu file len Actions (Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: nr3053-immortalwrt-${{ inputs.ib_version }}-usb
+          path: |
+            ${{ env.FW }}
+            ${{ env.FW }}.sha256
+            ${{ env.RD }}
+            ${{ env.RD }}.sha256
+
+      - name: 10. Dang len Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nr3053-${{ inputs.ib_version }}-b${{ github.run_number }}
+          name: NR3053 ImmortalWrt ${{ inputs.ib_version }} USB - build ${{ github.run_number }}
+          body: |
+            Kernel chinh hang ImmortalWrt ${{ inputs.ib_version }} + DTB NR3053 bat USB.
+            1) Chay thu trong RAM truoc: file *-initramfs-test.itb (U-Boot Web failsafe -> /initramfs.html). Khong ghi NAND.
+            2) On roi moi nap file *-squashfs-sysupgrade.bin (KHONG giu cau hinh lan dau).
+          files: |
+            ${{ env.FW }}
+            ${{ env.FW }}.sha256
+            ${{ env.RD }}
+            ${{ env.RD }}.sha256
