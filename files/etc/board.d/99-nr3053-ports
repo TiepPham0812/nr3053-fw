@@ -1,10 +1,16 @@
 #!/bin/sh
 # NR3053 chi co 3 cong LAN + 1 WAN (switch MT7531: wan, lan1, lan2, lan3).
-# Script mac dinh khong biet board nay nen tu them "lan4" khong ton tai -> sua lai.
-. /lib/functions/uci-defaults.sh
-
-board_config_update
-ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
-board_config_flush
-
+# Script mac dinh khong biet board nay nen tu them "lan4" khong ton tai.
+# ucidef_* chi NOI THEM vao danh sach cu, nen phai ghi de truc tiep vao board.json.
+CFG="${CFG:-/etc/board.json}"
+[ -s "$CFG" ] || exit 0
+CFG="$CFG" ucode -e '
+let fs = require("fs");
+let f = getenv("CFG");
+let j = json(fs.readfile(f));
+if (j?.network?.lan?.ports) {
+    j.network.lan.ports = [ "lan1", "lan2", "lan3" ];
+    fs.writefile(f, sprintf("%.J\n", j));
+}
+'
 exit 0
