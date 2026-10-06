@@ -11,6 +11,11 @@ on:
         description: "Phien ban ImmortalWrt (vd 25.12.1)"
         default: "25.12.1"
         required: true
+      usb_mode:
+        description: "Che do USB: usb3 (mac dinh) hoac usb2only (tat SuperSpeed, de iPhone/USB3 nhan on dinh hon)"
+        type: choice
+        options: [usb3, usb2only]
+        default: usb3
       extra_packages:
         description: "Goi cai them, cach nhau dau cach (de trong neu khong can)"
         default: ""
@@ -26,6 +31,7 @@ env:
     kmod-usb3 kmod-usb-xhci-mtk kmod-usb-storage kmod-usb-storage-uas usbutils
     kmod-usb-net-rndis kmod-usb-net-cdc-ether kmod-usb-net-cdc-ncm
     kmod-usb-net-ipheth usbmuxd libimobiledevice
+    -default-settings-chn
 
 jobs:
   build:
@@ -69,7 +75,12 @@ jobs:
           fi
           python3 -c "import lzma;assert lzma.decompress(open('kernel.lzma','rb').read(),format=lzma.FORMAT_ALONE)==open('$KDIR/Image','rb').read();print('LZMA OK')"
           od -A d -t x1 -N 13 kernel.lzma
-          cp ../dtb/nr3053-usb.dtb board.dtb
+          if [ "${{ inputs.usb_mode }}" = "usb2only" ]; then
+            cp ../dtb/nr3053-usb2only.dtb board.dtb
+          else
+            cp ../dtb/nr3053-usb.dtb board.dtb
+          fi
+          echo "Che do USB: ${{ inputs.usb_mode }} | phys: $(fdtget -t x board.dtb /soc/usb@11200000 phys)"
           echo "PHY USB: $(fdtget board.dtb /soc/usb-phy@11e10000 status)"
           echo "Board  : $(fdtget board.dtb / compatible)"
           cat > nr3053.its <<'EOF'
@@ -144,6 +155,11 @@ jobs:
 
       - name: 6. Dong firmware
         run: |
+          # File tao/sua tren web GitHub khong co quyen chay -> cap lai, va doi CRLF (Windows) -> LF
+          for f in files/etc/init.d/* files/etc/uci-defaults/* files/etc/board.d/*; do
+            [ -f "$f" ] || continue
+            sed -i 's/\r$//' "$f"; chmod 755 "$f"; echo "chmod 755 $f"
+          done
           cd ib
           make image PROFILE="$HOST_PROFILE" \
             PACKAGES="$BASE_PACKAGES ${{ inputs.extra_packages }}" \
@@ -168,6 +184,12 @@ jobs:
           for k in kmod-usb-xhci-mtk kmod-usb-net-rndis kmod-usb-net-ipheth kmod-usb-net-cdc-ncm; do
             grep -q "^P:$k$" r/lib/apk/db/installed && echo "OK  $k" || { echo "THIEU $k"; exit 1; }
           done
+          if grep -q "^P:default-settings-chn$" r/lib/apk/db/installed; then
+            echo "LOI: van con default-settings-chn (doi kho sang mirror TQ, mui gio Thuong Hai)"; exit 1
+          fi
+          unsquashfs -q -d f sysupgrade-*/root etc/uci-defaults etc/init.d/lockdown-persist etc/board.d >/dev/null 2>&1 || true
+          ls f/etc/uci-defaults/
+          test -x f/etc/uci-defaults/zz-nr3053-usb && test -x f/etc/init.d/lockdown-persist && test -x f/etc/board.d/99-nr3053-ports || { echo "LOI: thieu script cau hinh NR3053"; exit 1; }
           cd .. && sha256sum "$DST" | tee "$DST.sha256"
           echo "FW=$DST" >> "$GITHUB_ENV"
 
@@ -192,8 +214,8 @@ jobs:
       - name: 10. Dang len Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: nr3053-${{ inputs.ib_version }}-b${{ github.run_number }}
-          name: NR3053 ImmortalWrt ${{ inputs.ib_version }} USB - build ${{ github.run_number }}
+          tag_name: nr3053-${{ inputs.ib_version }}-${{ inputs.usb_mode }}-b${{ github.run_number }}
+          name: NR3053 ImmortalWrt ${{ inputs.ib_version }} ${{ inputs.usb_mode }} - build ${{ github.run_number }}
           body: |
             Kernel chinh hang ImmortalWrt ${{ inputs.ib_version }} + DTB NR3053 bat USB.
             1) Chay thu trong RAM truoc: file *-initramfs-test.itb (U-Boot Web failsafe -> /initramfs.html). Khong ghi NAND.
