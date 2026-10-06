@@ -1,0 +1,16 @@
+#!/bin/sh /etc/rc.common
+# Giu thong tin ghep doi iPhone (Tin cay may tinh nay) sau khi khoi dong lai.
+# /var nam tren RAM -> tro /var/lib/lockdown sang /etc/lockdown (nam tren NAND).
+START=15
+
+boot() {
+	mkdir -p /etc/lockdown /var/lib
+	chmod 700 /etc/lockdown
+	if [ -d /var/lib/lockdown ] && [ ! -L /var/lib/lockdown ]; then
+		cp -a /var/lib/lockdown/. /etc/lockdown/ 2>/dev/null
+		rm -rf /var/lib/lockdown
+	fi
+	[ -L /var/lib/lockdown ] || ln -s /etc/lockdown /var/lib/lockdown
+}
+
+start() { boot; }

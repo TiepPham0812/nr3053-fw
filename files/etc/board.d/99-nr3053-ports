@@ -1,0 +1,10 @@
+#!/bin/sh
+# NR3053 chi co 3 cong LAN + 1 WAN (switch MT7531: wan, lan1, lan2, lan3).
+# Script mac dinh khong biet board nay nen tu them "lan4" khong ton tai -> sua lai.
+. /lib/functions/uci-defaults.sh
+
+board_config_update
+ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
+board_config_flush
+
+exit 0
